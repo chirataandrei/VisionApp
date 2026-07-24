@@ -11,6 +11,15 @@ import { useAutoCapture } from './src/hooks/useAutoCapture';
 import { usePhotoWorkflow } from './src/hooks/usePhotoWorkflow';
 import { useProductAlignment } from './src/hooks/useProductAlignment';
 
+/**
+ * Master switch for any on-screen debug UI (raw pipeline telemetry, latency
+ * readouts, etc.) - everything of that kind must be gated behind this, not
+ * shown unconditionally. Flip to `true` locally when you need it; never
+ * commit it as `true`. Independent of `__DEV__`: a debug build should still
+ * look like the production camera UI by default.
+ */
+const ENABLE_DEBUG_UI = false;
+
 /** How long (ms) alignment/lighting/framing must all stay simultaneously ideal before a photo is captured automatically. */
 const AUTO_CAPTURE_ALIGNED_MS = 1000;
 
@@ -76,6 +85,13 @@ function App() {
       )}
       <CaptureCountdownRing perfect={perfect} durationMs={AUTO_CAPTURE_ALIGNED_MS} />
       <ShutterButton onPress={capturePhoto} disabled={isCapturing || isDone} />
+      {ENABLE_DEBUG_UI && analysis != null && (
+        <View style={styles.debugOverlay} pointerEvents="none">
+          <Text style={styles.debugText}>
+            {analysis.status} · {analysis.latencyMs.toFixed(1)}ms
+          </Text>
+        </View>
+      )}
     </View>
   );
 }
@@ -108,6 +124,20 @@ const styles = StyleSheet.create({
   doneText: {
     color: 'white',
     fontWeight: '600',
+  },
+  debugOverlay: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  debugText: {
+    color: '#00e676',
+    fontSize: 11,
+    fontVariant: ['tabular-nums'],
   },
 });
 

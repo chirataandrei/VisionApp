@@ -97,6 +97,7 @@ class ProductAnalyzerPlugin(proxy: VisionCameraProxy, @Suppress("UNUSED_PARAMETE
       2 -> "Centrează haina"
       3 -> "Ține telefonul mai drept"
       4 -> "Perfect!"
+      5 -> "Mișcare prea rapidă"
       else -> "Așează haina în cadru"
     }
 

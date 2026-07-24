@@ -41,9 +41,12 @@ struct ChromaPlane {
  * checked in strict priority order - only the single most impactful problem
  * is ever surfaced:
  *   1. Nothing significant in frame (or NotCentered's centering variant) -> NotCentered
- *   2. Bounding box touches the frame edge AND is large enough to
- *      plausibly be outgrowing the frame (a small box merely brushing
- *      the edge falls through to check 3 instead)                       -> CutOffMargins
+ *   2. Bounding box touches two OPPOSITE frame edges (left+right, or
+ *      top+bottom - not merely any one edge, which on physical devices is
+ *      routinely just sensor/lens noise or background clutter) AND covers
+ *      over 60% of the frame, so it's genuinely outgrowing it and not just
+ *      normally framed (a box that doesn't clear both bars falls through
+ *      to check 3 instead)                                              -> CutOffMargins
  *   3. Centroid too far from frame center, on either axis independently -> NotCentered
  *   4. Phone tilted (only checked once framing + centering already pass) -> PhoneTilted
  *   5. All of the above pass                                             -> Ok
@@ -109,9 +112,9 @@ struct AnalysisResult {
    */
   std::string message;
   /**
-   * Same information as `message`, as a small int (0-4) instead of a string:
+   * Same information as `message`, as a small int (0-5) instead of a string:
    * JNI can't marshal a std::string through the primitive array bridge to
-   * Android, so ProductAnalyzerPlugin.kt keeps its own copy of these five
+   * Android, so ProductAnalyzerPlugin.kt keeps its own copy of these six
    * strings and looks this up. iOS/C++ callers should just use `message`.
    */
   int messageCode = 0;
@@ -191,6 +194,13 @@ struct AnalysisResult {
  *
  * Not thread-safe across frames — VisionCamera invokes the frame processor
  * from a single camera thread, which this relies on for its tracking state.
+ * That's normally guaranteed by VisionCamera's serial, synchronous
+ * frame-processor invocation (frame N+1 is never delivered until frame N's
+ * call has returned) rather than anything this function does itself, but a
+ * non-blocking re-entrancy guard defends the assumption anyway: a call that
+ * somehow arrives while another is still in flight is dropped immediately
+ * (returns a fresh default result) rather than queued behind it or run
+ * concurrently against this file's unsynchronized tracking state.
  */
 AnalysisResult analyzeFrame(const uint8_t* data,
                             int width,

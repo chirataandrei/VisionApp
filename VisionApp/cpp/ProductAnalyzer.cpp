@@ -5,6 +5,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -108,6 +109,25 @@ constexpr int kTargetProcessingWidth = 240;
 // The tracking ROI is the previous bounding box grown by this fraction.
 constexpr double kRoiMarginFraction = 0.3;
 
+// ---- Motion-blur bypass (see analyzeFrame) ----
+
+// Variance of the Laplacian - the standard proxy for "how much
+// high-frequency detail survives" in an image. A frame blurred by fast
+// phone motion or rotation has almost none, so this collapses toward zero;
+// below this threshold the frame is too motion-blurred for contour
+// detection to mean anything, so it's skipped outright rather than wasting
+// a frame budget - and risking a stale/garbage detection - on it. Chosen
+// empirically (per the usual OpenCV blur-detection convention); frames with
+// genuine focused detail from a 240px-wide downscale typically score
+// several times higher than this.
+constexpr double kMinBlurVariance = 60.0;
+// AnalysisResult::messageCode for the motion-blur bypass - one past the
+// last index in kMessages, kept separate from AnalysisStatus's own
+// priority hierarchy (see classifyAlignment) since it's a distinct,
+// image-quality gate that preempts that hierarchy entirely rather than
+// being one more rung in it.
+constexpr int kMotionBlurMessageCode = 5;
+
 // ---- Alignment / framing classification ----
 
 // Tilt tolerance (degrees), per axis, for the phone to count as level.
@@ -134,14 +154,30 @@ constexpr double kCenterThresholdNorm = 0.20;
 // full-resolution frame, since both scale together.
 constexpr double kMinPresenceAreaFraction = 0.12;
 // How close (as a fraction of the corresponding frame dimension) the
-// bounding box must get to a frame edge to count as cut off.
-constexpr double kFramingEdgeMarginFraction = 0.03;
-// A bounding box touching the frame edge only counts as CutOffMargins if
-// it's also at least this large a fraction of the frame - a small object
-// that merely brushes the edge (tracking noise, a sleeve corner) isn't
-// "cut off", it just hasn't been centered yet; only a genuinely large
-// product that's outgrown the frame should read as cut off.
-constexpr double kCutOffMinAreaFraction = 0.35;
+// bounding box must get to a frame edge to count as touching it.
+// Deliberately generous (was 3%): on physical devices, sensor/lens noise
+// and background clutter routinely put a contour's edge within a few
+// percent of the frame boundary even when the product itself is nowhere
+// near actually being cut off, which was spuriously triggering
+// CutOffMargins - see the touchesOppositeMargins/kCutOffMinAreaFraction
+// doc comments below for the other two layers of defense against the same
+// false positive.
+constexpr double kFramingEdgeMarginFraction = 0.10;
+// CutOffMargins requires the bounding box to touch two OPPOSITE margins at
+// once (left+right, or top+bottom) - not merely any single edge. A single
+// edge touch is common, ordinary noise (the object drifted a bit far, a
+// sleeve brushed the frame boundary); spanning all the way from one side
+// of the frame to the other is a much stronger, harder-to-fake signal that
+// the product genuinely doesn't fit.
+//
+// A bounding box meeting that bar only counts as CutOffMargins if it's
+// ALSO at least this large a fraction of the frame - a small object that
+// merely brushes two edges (e.g. a thin diagonal sliver) isn't "cut off",
+// it just hasn't been centered yet; only a genuinely large product that's
+// outgrown the frame should read as cut off. Raised well above the
+// product's typical in-frame size (was 35%) specifically so ordinary
+// framing at a normal shooting distance can never trip this by accident.
+constexpr double kCutOffMinAreaFraction = 0.60;
 
 // Romanian instructions matching AnalysisStatus's priority hierarchy, in
 // AnalysisResult::messageCode order. Single source of truth: every branch of
@@ -153,6 +189,7 @@ constexpr const char* kMessages[] = {
     "Centrează haina",          // 2: off-center
     "Ține telefonul mai drept", // 3: phone tilted
     "Perfect!",                 // 4: ok
+    "Mișcare prea rapidă",      // 5: motion-blur bypass, see kMinBlurVariance
 };
 
 // Structuring elements for the morphological open/close below. Pure
@@ -197,6 +234,7 @@ struct PipelineState {
   cv::Mat contrast;
   cv::Mat mask;
   cv::Mat histogram;
+  cv::Mat laplacian;  // motion-blur variance scratch, see analyzeFrame
 
   // Color-saturation mask scratch (see computeSaturationValue) - all sized
   // to match `small`, so they're directly OR-able/sliceable against `mask`.
@@ -541,14 +579,19 @@ Alignment classifyAlignment(bool found, double pitchDegrees, double rollDegrees,
 
   const double edgeMarginX = frameWidth * kFramingEdgeMarginFraction;
   const double edgeMarginY = frameHeight * kFramingEdgeMarginFraction;
-  const bool touchesEdge = boundingBoxX <= edgeMarginX || boundingBoxY <= edgeMarginY ||
-                            boundingBoxX + boundingBoxWidth >= frameWidth - edgeMarginX ||
-                            boundingBoxY + boundingBoxHeight >= frameHeight - edgeMarginY;
+  const bool touchesLeft = boundingBoxX <= edgeMarginX;
+  const bool touchesRight = boundingBoxX + boundingBoxWidth >= frameWidth - edgeMarginX;
+  const bool touchesTop = boundingBoxY <= edgeMarginY;
+  const bool touchesBottom = boundingBoxY + boundingBoxHeight >= frameHeight - edgeMarginY;
+  // Two OPPOSITE margins, not merely any one edge - see
+  // kFramingEdgeMarginFraction's doc comment for why a single-edge touch
+  // isn't a reliable enough signal on its own.
+  const bool touchesOppositeMargins = (touchesLeft && touchesRight) || (touchesTop && touchesBottom);
 
   // b) Cut off at the frame margins - only for a product that's actually
   // large enough to plausibly be outgrowing the frame; a small box merely
-  // brushing the edge falls through to the centering/tilt checks instead.
-  if (touchesEdge && areaFraction > kCutOffMinAreaFraction) {
+  // brushing the edges falls through to the centering/tilt checks instead.
+  if (touchesOppositeMargins && areaFraction > kCutOffMinAreaFraction) {
     result.status = AnalysisStatus::CutOffMargins;
     result.messageCode = 1;
     return result;
@@ -637,6 +680,40 @@ cv::Rect expandedRoi(const cv::Rect& box, const cv::Size& imageSize) {
   return roi & cv::Rect(0, 0, imageSize.width, imageSize.height);
 }
 
+// Set for the duration of analyzeFrame's real work - see ProcessingGuard.
+std::atomic<bool> gIsProcessing{false};
+
+/**
+ * Non-blocking re-entrancy guard around analyzeFrame's global PipelineState.
+ * VisionCamera invokes frame processors synchronously and serially on a
+ * single dedicated thread - camera frame N+1 is never delivered until the
+ * call for frame N has returned, so this can never actually be contended
+ * under normal operation. It exists as defense-in-depth against that
+ * assumption ever being violated (a future VisionCamera version, a second
+ * camera session mid-device-switch, a bug), and specifically uses a
+ * lock-free compare-exchange rather than a mutex: a mutex would make a
+ * contended call BLOCK and wait its turn, which is exactly the "camera
+ * thread stalls while frames queue up behind a slow one" failure mode this
+ * needs to prevent - see analyzeFrame's use of it, which drops the frame
+ * (returns immediately) instead of waiting when acquisition fails.
+ */
+class ProcessingGuard {
+ public:
+  ProcessingGuard() : acquired_(!gIsProcessing.exchange(true, std::memory_order_acquire)) {}
+  ~ProcessingGuard() {
+    if (acquired_) {
+      gIsProcessing.store(false, std::memory_order_release);
+    }
+  }
+  ProcessingGuard(const ProcessingGuard&) = delete;
+  ProcessingGuard& operator=(const ProcessingGuard&) = delete;
+
+  bool acquired() const { return acquired_; }
+
+ private:
+  bool acquired_;
+};
+
 } // namespace
 
 void resetPipelineState() {
@@ -652,6 +729,18 @@ AnalysisResult analyzeFrame(const uint8_t* data,
                             int chromaHeight,
                             ChromaPlane chromaU,
                             ChromaPlane chromaV) {
+  // Frame-buffer management: if a previous call is somehow still in flight
+  // (should be unreachable - see ProcessingGuard's doc comment), drop this
+  // frame outright rather than queue behind it or race on gState's
+  // completely unsynchronized fields. Returning a fresh default here (not
+  // gState.lastResult) is deliberate: that other call is actively mutating
+  // gState right now, so reading ANY of its fields, even just-cached ones,
+  // would itself be a data race.
+  ProcessingGuard guard;
+  if (!guard.acquired()) {
+    return AnalysisResult{};
+  }
+
   const auto attitude = SensorFusion::instance().getAttitude();
 
   // Frame skipping: refresh only pitch/roll (and the alignment/tilt state
@@ -732,6 +821,37 @@ AnalysisResult analyzeFrame(const uint8_t* data,
                    layout == PixelLayout::BGRA8888 ? cv::COLOR_BGRA2GRAY : cv::COLOR_RGBA2GRAY);
       break;
     }
+  }
+
+  // Motion-blur bypass: a frame blurred by fast phone movement/rotation has
+  // almost no high-frequency detail left for the adaptive-contrast edge
+  // mask to find, so any contour still found in it is unreliable at best -
+  // and, worse, the full detection pipeline below is the expensive part of
+  // this function. Bail out immediately once we know the frame can't be
+  // trusted, before touching lighting/saturation/contours at all, so a
+  // burst of fast-motion frames costs a downscale + one Laplacian variance
+  // each (well under 1ms) instead of the full pipeline.
+  cv::Laplacian(gState.small, gState.laplacian, CV_64F);
+  cv::Scalar blurMean, blurStddev;
+  cv::meanStdDev(gState.laplacian, blurMean, blurStddev);
+  const double blurVariance = blurStddev[0] * blurStddev[0];
+  if (blurVariance < kMinBlurVariance) {
+    const Alignment alignment = classifyAlignment(false, attitude.pitchDegrees, attitude.rollDegrees,
+                                                    attitude.isFlatMode, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, width, height);
+    applyAlignment(result, alignment);
+    // Override with the motion-blur-specific status/message - status stays
+    // NotCentered (it already is, from classifyAlignment's found=false
+    // branch above), but the message/messageCode need to say why.
+    result.messageCode = kMotionBlurMessageCode;
+    result.message = kMessages[kMotionBlurMessageCode];
+    result.isReadyForCapture = false;
+    stabilizeStatus(gState, result);
+
+    const auto elapsed = std::chrono::steady_clock::now() - startTime;
+    result.latencyMs = std::chrono::duration<double, std::milli>(elapsed).count();
+
+    gState.lastResult = result;
+    return result;
   }
 
   result.lightingState = computeLightingState(gState.small, gState);
