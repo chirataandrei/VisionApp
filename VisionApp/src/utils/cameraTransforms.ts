@@ -48,24 +48,6 @@ export function uprightDimensions(
   }
 }
 
-/** Maps a point in raw frame pixel space to upright screen space. */
-export function mapFrameToScreen(
-  frameX: number,
-  frameY: number,
-  frameWidth: number,
-  frameHeight: number,
-  orientation: Orientation,
-  screenWidth: number,
-  screenHeight: number,
-): Point {
-  const upright = mapPointToUpright(frameX, frameY, frameWidth, frameHeight, orientation);
-  const { width: uprightWidth, height: uprightHeight } = uprightDimensions(frameWidth, frameHeight, orientation);
-  return {
-    x: (upright.x / uprightWidth) * screenWidth,
-    y: (upright.y / uprightHeight) * screenHeight,
-  };
-}
-
 /**
  * Maps a bounding box in raw frame pixel space to upright frame-pixel space
  * (not further scaled to screen size), for cropping a captured photo to the

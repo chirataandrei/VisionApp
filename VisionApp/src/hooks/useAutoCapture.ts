@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react';
+import HapticFeedback from 'react-native-haptic-feedback';
 
 /**
  * Fires `onCapture` once alignment holds continuously for `delayMs`.
@@ -7,6 +8,11 @@ import { useCallback, useEffect, useRef } from 'react';
  * signal, starting the timer on "became aligned" and cancelling it on
  * "became misaligned" (or when `enabled` is false) so a photo is never
  * captured from a stale alignment state.
+ *
+ * Fires a distinct haptic pulse right as the timer completes - a tactile
+ * "shutter click" for the capture itself, separate from (and a beat after)
+ * the lighter "became ready" haptic AlignmentOverlay fires when alignment
+ * first turns perfect.
  */
 export function useAutoCapture(onCapture: () => void, delayMs: number, enabled: boolean) {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -28,6 +34,7 @@ export function useAutoCapture(onCapture: () => void, delayMs: number, enabled: 
       if (aligned && enabled) {
         timer.current = setTimeout(() => {
           timer.current = null;
+          HapticFeedback.trigger('impactMedium', { enableVibrateFallback: true });
           onCapture();
         }, delayMs);
       }

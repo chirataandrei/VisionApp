@@ -1,17 +1,18 @@
 import React, { useEffect, useRef } from 'react';
-import { StatusBar, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
+import { StatusBar, StyleSheet, Text, View } from 'react-native';
 import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 
 import { AlignmentOverlay } from './src/components/AlignmentOverlay';
-import { QualityBadges } from './src/components/QualityBadges';
+import { CaptureCountdownRing } from './src/components/CaptureCountdownRing';
+import { FeedbackBanner } from './src/components/FeedbackBanner';
 import { ShutterButton } from './src/components/ShutterButton';
 import { WorkflowStepper } from './src/components/WorkflowStepper';
 import { useAutoCapture } from './src/hooks/useAutoCapture';
 import { usePhotoWorkflow } from './src/hooks/usePhotoWorkflow';
 import { useProductAlignment } from './src/hooks/useProductAlignment';
 
-/** How long (ms) `isAligned` must stay true before a photo is captured automatically. */
-const AUTO_CAPTURE_ALIGNED_MS = 500;
+/** How long (ms) alignment/lighting/framing must all stay simultaneously ideal before a photo is captured automatically. */
+const AUTO_CAPTURE_ALIGNED_MS = 1000;
 
 /** Vinted multi-photo listing workflow, in order. */
 const PHOTO_STEPS = ['Poza de Fata', 'Poza de Spate', 'Eticheta Marime/Brand', 'Defecte/Detalii'] as const;
@@ -19,7 +20,6 @@ const PHOTO_STEPS = ['Poza de Fata', 'Poza de Spate', 'Eticheta Marime/Brand', '
 function App() {
   const device = useCameraDevice('back');
   const { hasPermission, requestPermission } = useCameraPermission();
-  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
   const camera = useRef<Camera>(null);
 
   useEffect(() => {
@@ -28,8 +28,8 @@ function App() {
     }
   }, [hasPermission, requestPermission]);
 
-  const { frameProcessor, pitch, roll, found, centroidX, centroidY, analysis, lastDetectionRef } =
-    useProductAlignment(device?.id, screenWidth, screenHeight);
+  const { frameProcessor, tiltX, tiltY, found, guideStage, perfect, analysis, lastDetectionRef } =
+    useProductAlignment(device?.id);
 
   const { capturePhoto, isCapturing, stepIndex, isDone, capturedPhotos } = usePhotoWorkflow(
     camera,
@@ -67,35 +67,23 @@ function App() {
         frameProcessor={frameProcessor}
       />
       <AlignmentOverlay
-        pitch={pitch}
-        roll={roll}
+        mode={analysis?.orientationMode ?? 'FLAT'}
+        tiltX={tiltX}
+        tiltY={tiltY}
         found={found}
-        centroidX={centroidX}
-        centroidY={centroidY}
+        guideStage={guideStage}
+        perfect={perfect}
         onAlignedChange={handleAlignedChange}
       />
       <WorkflowStepper steps={PHOTO_STEPS} currentIndex={stepIndex} />
-      <View style={styles.panel} pointerEvents="none">
-        <Text style={styles.panelTitle}>Product Analyzer (C++ / OpenCV)</Text>
-        {analysis == null ? (
-          <Text style={styles.panelText}>Waiting for frames…</Text>
-        ) : (
-          <>
-            <Text style={styles.panelText}>
-              Pitch: {analysis.pitch.toFixed(1)}°   Roll: {analysis.roll.toFixed(1)}°   C++:{' '}
-              {analysis.latencyMs.toFixed(1)} ms
-            </Text>
-            <Text style={styles.panelText}>
-              {analysis.found
-                ? `Centroid: (${analysis.centroid.x.toFixed(0)}, ${analysis.centroid.y.toFixed(0)}) ` +
-                  `in ${analysis.frameWidth}×${analysis.frameHeight}  ·  area ${Math.round(analysis.contourArea)}px²`
-                : 'No product contour detected'}
-            </Text>
-            <QualityBadges exposureWarning={analysis.exposureWarning} />
-            {isDone && <Text style={styles.panelText}>{Object.keys(capturedPhotos).length} poze salvate</Text>}
-          </>
-        )}
-      </View>
+      {isDone ? (
+        <View style={styles.doneBanner} pointerEvents="none">
+          <Text style={styles.doneText}>{Object.keys(capturedPhotos).length} poze salvate</Text>
+        </View>
+      ) : (
+        <FeedbackBanner analysis={analysis} />
+      )}
+      <CaptureCountdownRing perfect={perfect} durationMs={AUTO_CAPTURE_ALIGNED_MS} />
       <ShutterButton onPress={capturePhoto} disabled={isCapturing || isDone} />
     </View>
   );
@@ -116,23 +104,19 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 16,
   },
-  panel: {
+  doneBanner: {
     position: 'absolute',
+    bottom: 140,
     left: 16,
     right: 16,
-    bottom: 140,
-    borderRadius: 12,
+    alignItems: 'center',
+    borderRadius: 20,
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
-    padding: 12,
+    paddingVertical: 10,
   },
-  panelTitle: {
+  doneText: {
     color: 'white',
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  panelText: {
-    color: 'white',
-    fontVariant: ['tabular-nums'],
+    fontWeight: '600',
   },
 });
 

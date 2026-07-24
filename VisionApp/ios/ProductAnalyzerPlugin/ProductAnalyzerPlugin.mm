@@ -89,7 +89,29 @@
     const int width = (int)CVPixelBufferGetWidthOfPlane(pixelBuffer, 0);
     const int height = (int)CVPixelBufferGetHeightOfPlane(pixelBuffer, 0);
     const size_t bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
-    result = visionapp::analyzeFrame(data, width, height, bytesPerRow, visionapp::PixelLayout::GRAY8);
+
+    // Plane 1, when present, is interleaved CbCr (biplanar 4:2:0 - the
+    // format VisionCamera's pixelFormat="yuv" delivers on iOS): U (Cb) and
+    // V (Cr) share one physical buffer, U at byte offset 0 and V at byte
+    // offset 1, both effectively pixelStride 2 - see ChromaPlane's doc
+    // comment. Feeds the native color-saturation mask that helps
+    // distinguish garments from neutral-toned backgrounds (a TV, a wall, a
+    // wood floor).
+    int chromaWidth = 0;
+    int chromaHeight = 0;
+    visionapp::ChromaPlane chromaU;
+    visionapp::ChromaPlane chromaV;
+    if (CVPixelBufferGetPlaneCount(pixelBuffer) > 1) {
+      const auto* chromaBase = static_cast<const uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
+      chromaWidth = (int)CVPixelBufferGetWidthOfPlane(pixelBuffer, 1);
+      chromaHeight = (int)CVPixelBufferGetHeightOfPlane(pixelBuffer, 1);
+      const size_t chromaRowStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
+      chromaU = {chromaBase, chromaRowStride, 2};
+      chromaV = {chromaBase + 1, chromaRowStride, 2};
+    }
+
+    result = visionapp::analyzeFrame(data, width, height, bytesPerRow, visionapp::PixelLayout::GRAY8, chromaWidth,
+                                      chromaHeight, chromaU, chromaV);
   } else {
     // Non-planar RGB camera output is 32BGRA on iOS.
     const auto* data = static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(pixelBuffer));
@@ -101,32 +123,59 @@
 
   CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
-  NSString* exposureWarning;
-  switch (result.exposureWarning) {
-    case visionapp::ExposureWarning::TooDark:
-      exposureWarning = @"dark";
+  NSString* status;
+  switch (result.status) {
+    case visionapp::AnalysisStatus::CutOffMargins:
+      status = @"CUT_OFF_MARGINS";
       break;
-    case visionapp::ExposureWarning::TooBright:
-      exposureWarning = @"bright";
+    case visionapp::AnalysisStatus::PhoneTilted:
+      status = @"PHONE_TILTED";
       break;
-    case visionapp::ExposureWarning::None:
+    case visionapp::AnalysisStatus::Ok:
+      status = @"OK";
+      break;
+    case visionapp::AnalysisStatus::NotCentered:
     default:
-      exposureWarning = @"none";
+      status = @"NOT_CENTERED";
       break;
   }
 
+  NSString* lightingState;
+  switch (result.lightingState) {
+    case visionapp::LightingState::TooDark:
+      lightingState = @"TOO_DARK";
+      break;
+    case visionapp::LightingState::Overexposed:
+      lightingState = @"OVEREXPOSED";
+      break;
+    case visionapp::LightingState::Good:
+    default:
+      lightingState = @"GOOD";
+      break;
+  }
+
+  NSString* orientationMode = result.orientationMode == visionapp::OrientationMode::Hanger ? @"HANGER" : @"FLAT";
+
   // Converted to a plain JS object by VisionCamera via JSI (no bridge).
-  return @{
+  // Only the derived state/vectors below are meant for production UI; the
+  // exact pixel/degree readings are gated behind #ifdef DEBUG so a release
+  // build never ships raw sensor/vision telemetry to JS - see
+  // ProductAnalyzer.h's AnalysisResult doc comment.
+  NSMutableDictionary* payload = [@{
     @"found" : @(result.found),
-    @"centroid" : @{
-      @"x" : @(result.centroidX),
-      @"y" : @(result.centroidY),
+    @"status" : status,
+    @"message" : @(result.message.c_str()),
+    @"isReadyForCapture" : @(result.isReadyForCapture),
+    @"lightingState" : lightingState,
+    @"orientationMode" : orientationMode,
+    @"normalizedDx" : @(result.normalizedDx),
+    @"normalizedDy" : @(result.normalizedDy),
+    @"tilt" : @{
+      @"dx" : @(result.tilt.dx),
+      @"dy" : @(result.tilt.dy),
     },
-    @"contourArea" : @(result.contourArea),
     @"frameWidth" : @(result.frameWidth),
     @"frameHeight" : @(result.frameHeight),
-    @"pitch" : @(result.pitchDegrees),
-    @"roll" : @(result.rollDegrees),
     @"latencyMs" : @(result.latencyMs),
     @"processed" : @(result.processed),
     @"boundingBox" : @{
@@ -135,8 +184,21 @@
       @"width" : @(result.boundingBoxWidth),
       @"height" : @(result.boundingBoxHeight),
     },
-    @"exposureWarning" : exposureWarning,
+  } mutableCopy];
+
+#ifdef DEBUG
+  payload[@"debug"] = @{
+    @"centroid" : @{
+      @"x" : @(result.centroidX),
+      @"y" : @(result.centroidY),
+    },
+    @"contourArea" : @(result.contourArea),
+    @"pitch" : @(result.pitchDegrees),
+    @"roll" : @(result.rollDegrees),
   };
+#endif
+
+  return payload;
 }
 
 VISION_EXPORT_FRAME_PROCESSOR(ProductAnalyzerPlugin, analyzeProduct)

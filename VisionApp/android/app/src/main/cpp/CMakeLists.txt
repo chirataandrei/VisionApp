@@ -33,6 +33,11 @@ add_library(
 
 target_include_directories(productanalyzer PRIVATE "${SHARED_CPP_DIR}")
 
+# CMake's Debug config doesn't define DEBUG by default (only Release defines
+# NDEBUG) - define it explicitly so ProductAnalyzer.cpp's #ifdef DEBUG guards
+# behave the same as Xcode's Debug configuration on iOS.
+target_compile_definitions(productanalyzer PRIVATE $<$<CONFIG:Debug>:DEBUG>)
+
 # 16 KB page-size devices (Android 15+) reject 4 KB-aligned ELF segments.
 target_link_options(productanalyzer PRIVATE "-Wl,-z,max-page-size=16384")
 
