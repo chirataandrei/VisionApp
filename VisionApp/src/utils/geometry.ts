@@ -10,16 +10,6 @@ export interface Box {
   height: number;
 }
 
-/**
- * Euclidean distance for a (dx, dy) offset. Carries the `'worklet'`
- * directive so it can be called from Reanimated UI-thread derived
- * values/animated styles as well as plain JS code.
- */
-export function distance(dx: number, dy: number): number {
-  'worklet';
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
 /** Smallest axis-aligned box containing all of `points`. */
 export function boundingBoxOfPoints(points: readonly Point[]): Box {
   const xs = points.map(point => point.x);

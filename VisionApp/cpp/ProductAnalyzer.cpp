@@ -222,8 +222,9 @@ PipelineState gState;
 
 /**
  * Score = Area × AspectAreaRatio × (1 - EdgeLinearity), used by
- * detectBestContour to pick the garment out of several candidate contours
- * instead of blindly assuming the largest one is the product.
+ * detectBestContour to rank the candidates that survive its hard
+ * convex-rectangle filter (see there) instead of blindly assuming the
+ * largest one is the product.
  *
  * AspectAreaRatio is the contour's "extent" (its own area divided by its
  * bounding box's area, capped at 1.0): a curved, organic garment silhouette
@@ -231,11 +232,11 @@ PipelineState gState;
  * object fills nearly all of it - so this factor alone would actually favor
  * a TV, which is exactly what EdgeLinearity exists to counteract.
  *
- * EdgeLinearity comes from simplifying the contour with approxPolyDP: a
- * curved silhouette needs many vertices to approximate within tolerance and
- * so keeps EdgeLinearity at 0 (no penalty), while an object with genuinely
- * straight edges (a TV, a shelf, a picture frame on the wall) collapses
- * down to a handful of vertices and gets penalized (see
+ * `looksLinear` - whether the contour approximates to a small (4-6-vertex)
+ * polygon - is computed once by the caller and reused for both its hard
+ * filter and this softer one: a few-cornered contour that ISN'T convex (an
+ * L-shape, a concave silhouette) isn't disqualified outright, but still
+ * reads as suspiciously simple and gets penalized here (see
  * kLinearShapeEdgeLinearity's doc comment on why this is a strong penalty
  * rather than outright disqualification) - and, when color data is
  * available (`saturationValue` non-empty), penalized further still if it's
@@ -245,16 +246,9 @@ PipelineState gState;
  * garment (never looksLinear to begin with) is completely unaffected by
  * saturation either way.
  */
-double scoreContour(const std::vector<cv::Point>& contour, double area, const cv::Rect& boundingBox,
-                     const cv::Mat& saturationValue) {
+double scoreContour(double area, const cv::Rect& boundingBox, bool looksLinear, const cv::Mat& saturationValue) {
   const double boundingBoxArea = static_cast<double>(boundingBox.width) * boundingBox.height;
   const double aspectAreaRatio = boundingBoxArea > 0.0 ? std::clamp(area / boundingBoxArea, 0.0, 1.0) : 0.0;
-
-  std::vector<cv::Point> approx;
-  const double perimeter = cv::arcLength(contour, true);
-  cv::approxPolyDP(contour, approx, perimeter * kApproxPolyEpsilonFraction, true);
-  const bool looksLinear =
-      static_cast<int>(approx.size()) >= kLinearShapeMinVertices && static_cast<int>(approx.size()) <= kLinearShapeMaxVertices;
 
   double edgeLinearity = 0.0;
   if (looksLinear) {
@@ -294,8 +288,16 @@ double scoreContour(const std::vector<cv::Point>& contour, double area, const cv
  *
  * The winning contour is no longer just the largest one, either: a TV, a
  * wall panel, or a piece of furniture in the background can easily out-area
- * a garment, so every contour clearing the `minArea` floor is ranked by
- * scoreContour and the highest-scoring one wins.
+ * a garment. Every contour clearing the `minArea` floor first goes through a
+ * hard filter - approximate it with approxPolyDP, and if it simplifies to a
+ * convex 4-6-vertex polygon, skip it outright (`continue`), since a genuine
+ * straight-edged rectangular object (a TV, a picture frame, a door, a
+ * shelf) is exactly that, while a garment silhouette even when it happens
+ * to approximate to a similar vertex count is virtually never convex
+ * (necklines, sleeves, and hems all carve concave notches into the
+ * outline). Whatever survives that filter is ranked by scoreContour (which
+ * still softly penalizes a few-cornered-but-non-convex shape) and the
+ * highest-scoring one wins.
  *
  * `saturationValue` (see computeSaturationValue) must already be in the
  * SAME coordinate space as `gray` - when `gray` is an ROI sub-view of
@@ -344,8 +346,23 @@ std::optional<Detection> detectBestContour(const cv::Mat& gray, double minArea, 
     if (area < minArea) {
       continue;
     }
+
+    std::vector<cv::Point> approx;
+    const double perimeter = cv::arcLength(contour, true);
+    cv::approxPolyDP(contour, approx, perimeter * kApproxPolyEpsilonFraction, true);
+    const bool looksLinear = static_cast<int>(approx.size()) >= kLinearShapeMinVertices &&
+                              static_cast<int>(approx.size()) <= kLinearShapeMaxVertices;
+
+    // Hard filter: a convex 4-6-sided polygon is a genuine straight-edged
+    // rectangular object (a TV, a picture frame, a door, a shelf), not a
+    // garment - skip it outright rather than merely score-penalizing it, so
+    // it can never win regardless of how large or well-lit it is.
+    if (looksLinear && cv::isContourConvex(approx)) {
+      continue;
+    }
+
     const cv::Rect boundingBox = cv::boundingRect(contour);
-    const double score = scoreContour(contour, area, boundingBox, saturationValue);
+    const double score = scoreContour(area, boundingBox, looksLinear, saturationValue);
     if (score > bestScore) {
       bestScore = score;
       bestArea = area;

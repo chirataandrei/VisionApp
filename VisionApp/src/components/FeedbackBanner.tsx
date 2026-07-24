@@ -35,6 +35,11 @@ export interface FeedbackBannerProps {
  * button/capture countdown ring - right where the user's attention already
  * is when they're about to take the photo, rather than up at the top with
  * the step banner (see WorkflowStepper).
+ *
+ * Styled to match WorkflowStepper's frosted-glass pill. No blur library is
+ * installed in this project, so the "glass" look is approximated with a
+ * translucent fill, a light border highlight, and a soft shadow rather than
+ * a true backdrop blur.
  */
 export function FeedbackBanner({ analysis }: FeedbackBannerProps) {
   return (
@@ -48,13 +53,20 @@ const styles = StyleSheet.create({
   banner: {
     position: 'absolute',
     bottom: 140,
-    left: 16,
-    right: 16,
+    alignSelf: 'center',
+    maxWidth: '88%',
     alignItems: 'center',
     paddingHorizontal: 20,
     paddingVertical: 10,
     borderRadius: 20,
-    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.28)',
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 6,
   },
   text: {
     color: 'white',

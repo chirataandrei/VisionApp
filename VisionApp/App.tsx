@@ -28,8 +28,7 @@ function App() {
     }
   }, [hasPermission, requestPermission]);
 
-  const { frameProcessor, tiltX, tiltY, found, guideStage, perfect, analysis, lastDetectionRef } =
-    useProductAlignment(device?.id);
+  const { frameProcessor, found, isOk, perfect, analysis, lastDetectionRef } = useProductAlignment(device?.id);
 
   const { capturePhoto, isCapturing, stepIndex, isDone, capturedPhotos } = usePhotoWorkflow(
     camera,
@@ -66,15 +65,7 @@ function App() {
         pixelFormat="yuv"
         frameProcessor={frameProcessor}
       />
-      <AlignmentOverlay
-        mode={analysis?.orientationMode ?? 'FLAT'}
-        tiltX={tiltX}
-        tiltY={tiltY}
-        found={found}
-        guideStage={guideStage}
-        perfect={perfect}
-        onAlignedChange={handleAlignedChange}
-      />
+      <AlignmentOverlay isOk={isOk} found={found} perfect={perfect} onAlignedChange={handleAlignedChange} />
       <WorkflowStepper steps={PHOTO_STEPS} currentIndex={stepIndex} />
       {isDone ? (
         <View style={styles.doneBanner} pointerEvents="none">
