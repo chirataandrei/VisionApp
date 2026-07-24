@@ -8,11 +8,14 @@ import Animated, {
   useAnimatedReaction,
   useAnimatedStyle,
   useDerivedValue,
+  useSharedValue,
   withRepeat,
   withSequence,
   withTiming,
   type SharedValue,
 } from 'react-native-reanimated';
+
+import { distance } from '../utils/geometry';
 
 /** Tilt tolerance (degrees) for the phone to count as "flat". */
 const LEVEL_THRESHOLD_DEG = 3;
@@ -20,6 +23,8 @@ const LEVEL_THRESHOLD_DEG = 3;
 const MAX_TILT_DEG = 30;
 /** How close (px) the centroid must be to the screen center to count as centered. */
 const CENTER_THRESHOLD_PX = 60;
+/** Minimum time (ms) between two success haptics, so jitter around the alignment threshold can't buzz repeatedly. */
+const HAPTIC_COOLDOWN_MS = 1500;
 
 const LEVEL_SIZE = 150;
 const BUBBLE_SIZE = 36;
@@ -35,6 +40,8 @@ export interface AlignmentOverlayProps {
   /** Centroid of the detected contour, mapped to screen coordinates (px). */
   centroidX: SharedValue<number>;
   centroidY: SharedValue<number>;
+  /** Called on every aligned/misaligned transition (i.e. not on every frame). */
+  onAlignedChange?: (aligned: boolean) => void;
 }
 
 /**
@@ -43,20 +50,16 @@ export interface AlignmentOverlayProps {
  *  - an arrow from the screen center to the detected object's centroid,
  *  - a green border flash + haptic feedback when both are aligned.
  */
-export function AlignmentOverlay({ pitch, roll, found, centroidX, centroidY }: AlignmentOverlayProps) {
+export function AlignmentOverlay({ pitch, roll, found, centroidX, centroidY, onAlignedChange }: AlignmentOverlayProps) {
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
   const centerX = screenWidth / 2;
   const centerY = screenHeight / 2;
 
   // ---- derived signals ----------------------------------------------------
 
-  const tiltMagnitude = useDerivedValue(() => Math.sqrt(pitch.value ** 2 + roll.value ** 2));
+  const tiltMagnitude = useDerivedValue(() => distance(pitch.value, roll.value));
 
-  const centroidDistance = useDerivedValue(() => {
-    const dx = centroidX.value - centerX;
-    const dy = centroidY.value - centerY;
-    return Math.sqrt(dx * dx + dy * dy);
-  });
+  const centroidDistance = useDerivedValue(() => distance(centroidX.value - centerX, centroidY.value - centerY));
 
   const isAligned = useDerivedValue(
     () =>
@@ -85,11 +88,20 @@ export function AlignmentOverlay({ pitch, roll, found, centroidX, centroidY }: A
     HapticFeedback.trigger('notificationSuccess', { enableVibrateFallback: true });
   }, []);
 
+  const lastHapticTimestamp = useSharedValue(0);
+
   useAnimatedReaction(
     () => isAligned.value,
     (aligned, wasAligned) => {
+      if (aligned !== wasAligned && onAlignedChange != null) {
+        runOnJS(onAlignedChange)(aligned);
+      }
       if (aligned && wasAligned !== true) {
-        runOnJS(triggerHaptic)();
+        const now = Date.now();
+        if (now - lastHapticTimestamp.value >= HAPTIC_COOLDOWN_MS) {
+          lastHapticTimestamp.value = now;
+          runOnJS(triggerHaptic)();
+        }
       }
     },
   );
@@ -126,10 +138,10 @@ export function AlignmentOverlay({ pitch, roll, found, centroidX, centroidY }: A
   const arrowStyle = useAnimatedStyle(() => {
     const dx = centroidX.value - centerX;
     const dy = centroidY.value - centerY;
-    const distance = Math.sqrt(dx * dx + dy * dy);
+    const dist = centroidDistance.value;
     const angle = Math.atan2(dy, dx);
-    const visible = found.value > 0.5 && distance > CENTER_THRESHOLD_PX;
-    const length = Math.min(distance - 24, Math.min(screenWidth, screenHeight) * 0.4);
+    const visible = found.value > 0.5 && dist > CENTER_THRESHOLD_PX;
+    const length = Math.min(dist - 24, Math.min(screenWidth, screenHeight) * 0.4);
     return {
       opacity: withTiming(visible ? 0.95 : 0, { duration: 150 }),
       width: Math.max(length, 0),

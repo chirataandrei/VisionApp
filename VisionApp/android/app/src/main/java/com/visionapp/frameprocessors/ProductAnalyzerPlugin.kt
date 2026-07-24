@@ -6,6 +6,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import com.facebook.react.bridge.LifecycleEventListener
 import com.mrousavy.camera.frameprocessors.Frame
 import com.mrousavy.camera.frameprocessors.FrameProcessorPlugin
 import com.mrousavy.camera.frameprocessors.VisionCameraProxy
@@ -18,16 +19,31 @@ import java.nio.ByteBuffer
  * buffer (zero-copy direct ByteBuffer) into the shared C++ pipeline via JNI.
  */
 class ProductAnalyzerPlugin(proxy: VisionCameraProxy, @Suppress("UNUSED_PARAMETER") options: Map<String, Any>?) :
-  FrameProcessorPlugin(), SensorEventListener {
+  FrameProcessorPlugin(), SensorEventListener, LifecycleEventListener {
+
+  private val reactContext = proxy.context
+  private val sensorManager = reactContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
 
   init {
-    val sensorManager = proxy.context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
       sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
     }
     sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)?.let {
       sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
     }
+    // FrameProcessorPlugin has no destroy/dispose hook, so this is the only
+    // reliable signal to unregister the sensor listener (RN reload, activity
+    // destroy) - without it, this plugin instance and its listener registration
+    // leak for the lifetime of the SensorManager (i.e. the process).
+    reactContext.addLifecycleEventListener(this)
+  }
+
+  override fun onHostResume() = Unit
+  override fun onHostPause() = Unit
+
+  override fun onHostDestroy() {
+    sensorManager.unregisterListener(this)
+    reactContext.removeLifecycleEventListener(this)
   }
 
   override fun onSensorChanged(event: SensorEvent) {
@@ -46,7 +62,18 @@ class ProductAnalyzerPlugin(proxy: VisionCameraProxy, @Suppress("UNUSED_PARAMETE
 
   override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
+  private fun exposureWarningLabel(code: Int): String =
+    when (code) {
+      1 -> "dark"
+      2 -> "bright"
+      else -> "none"
+    }
+
   override fun callback(frame: Frame, params: Map<String, Any>?): Any? {
+    if (params?.get("reset") == true) {
+      nativeResetPipeline()
+    }
+
     val image = frame.image
     val plane = image.planes[0]
     // For YUV_420_888 frames, plane 0 is the luma (Y) plane — already grayscale.
@@ -63,7 +90,15 @@ class ProductAnalyzerPlugin(proxy: VisionCameraProxy, @Suppress("UNUSED_PARAMETE
       "pitch" to values[6],
       "roll" to values[7],
       "latencyMs" to values[8],
-      "processed" to (values[9] != 0.0)
+      "processed" to (values[9] != 0.0),
+      "boundingBox" to
+        hashMapOf(
+          "x" to values[10],
+          "y" to values[11],
+          "width" to values[12],
+          "height" to values[13]
+        ),
+      "exposureWarning" to exposureWarningLabel(values[14].toInt())
     )
   }
 
@@ -77,6 +112,9 @@ class ProductAnalyzerPlugin(proxy: VisionCameraProxy, @Suppress("UNUSED_PARAMETE
 
     @JvmStatic
     private external fun nativeUpdateGyroscope(gx: Double, gy: Double, gz: Double, timestampSeconds: Double)
+
+    @JvmStatic
+    private external fun nativeResetPipeline()
 
     @JvmStatic
     private external fun nativeAnalyzeFrame(

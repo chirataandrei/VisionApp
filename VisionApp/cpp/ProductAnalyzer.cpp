@@ -1,8 +1,10 @@
 #include "ProductAnalyzer.h"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -14,11 +16,31 @@ namespace visionapp {
 
 namespace {
 
-constexpr double kCannyThresholdLow = 50.0;
-constexpr double kCannyThresholdHigh = 150.0;
 constexpr int kGaussianKernelSize = 5;
+// Local-background blur radius for the adaptive contrast threshold: cast
+// shadows are smooth over a much wider area than genuine fabric/edge detail,
+// so comparing each pixel against a blur this wide isolates real edges while
+// shadow gradients average into their own local background and vanish.
+constexpr int kLocalContrastKernelSize = 31;
+// Minimum |pixel - localMean| to count as a foreground edge.
+constexpr double kContrastThreshold = 12.0;
+// Structuring element used to close gaps between the many small edges a
+// patterned/textured garment produces, merging them into one silhouette.
+constexpr int kMorphCloseKernelSize = 9;
 // Contours smaller than this fraction of the (downscaled) frame are noise.
 constexpr double kMinContourAreaFraction = 0.001;
+// EMA smoothing factor for the reported centroid (0 < a <= 1): higher tracks
+// the raw detection more closely, lower damps jitter more but adds lag.
+constexpr double kCentroidSmoothingAlpha = 0.35;
+
+// Brightness histogram bins (8-bit grayscale, so 256 of them).
+constexpr int kExposureHistogramBins = 256;
+// Intensities below this count toward "shadow" for exposure purposes.
+constexpr int kShadowClipBin = 25;
+// Intensities at/above this count toward "highlight" for exposure purposes.
+constexpr int kHighlightClipBin = 230;
+// Fraction of pixels that must fall in the shadow/highlight range to warn.
+constexpr double kExposureClipFraction = 0.35;
 
 // Only every Nth call runs the pipeline; the rest reuse the cached result.
 constexpr uint64_t kProcessEveryNthFrame = 3;
@@ -40,19 +62,50 @@ struct PipelineState {
   bool hasRoi = false;
   cv::Rect roi;             // in downscaled-image coordinates
   AnalysisResult lastResult;
+
+  // EMA state for the reported centroid, in full-resolution frame pixel
+  // space. Cleared whenever the object is lost so the next detection snaps
+  // to place instead of lerping in from a stale position.
+  bool hasSmoothedCentroid = false;
+  double smoothedCentroidX = 0.0;
+  double smoothedCentroidY = 0.0;
 };
 PipelineState gState;
 
-/** blur → Canny → largest contour → centroid, on an already-gray image. */
+/**
+ * blur → adaptive local-contrast threshold → morphological close → largest
+ * contour → centroid, on an already-gray image.
+ *
+ * Unlike Canny (a fixed gradient-magnitude threshold, which still fires on
+ * the soft gradient a cast shadow leaves behind even after blurring), each
+ * pixel here is compared to its own local neighborhood mean: true object
+ * edges have high local contrast, while a shadow - smooth and gradual -
+ * averages into its own background and stays below threshold regardless of
+ * how dark it is. This is also polarity-agnostic, unlike a binary threshold
+ * that has to assume which side (light or dark) is the foreground.
+ */
 std::optional<Detection> detectLargestContour(const cv::Mat& gray, double minArea) {
-  cv::Mat blurred;
-  cv::GaussianBlur(gray, blurred, cv::Size(kGaussianKernelSize, kGaussianKernelSize), 0);
+  cv::Mat denoised;
+  cv::GaussianBlur(gray, denoised, cv::Size(kGaussianKernelSize, kGaussianKernelSize), 0);
 
-  cv::Mat edges;
-  cv::Canny(blurred, edges, kCannyThresholdLow, kCannyThresholdHigh);
+  cv::Mat localMean;
+  cv::GaussianBlur(denoised, localMean, cv::Size(kLocalContrastKernelSize, kLocalContrastKernelSize), 0);
+
+  cv::Mat contrast;
+  cv::absdiff(denoised, localMean, contrast);
+
+  cv::Mat mask;
+  cv::threshold(contrast, mask, kContrastThreshold, 255, cv::THRESH_BINARY);
+
+  // Bridge the many small edges a patterned/textured garment produces into
+  // one connected silhouette, so its outer boundary is the largest contour
+  // instead of dozens of fragments.
+  const cv::Mat kernel =
+      cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kMorphCloseKernelSize, kMorphCloseKernelSize));
+  cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
 
   std::vector<std::vector<cv::Point>> contours;
-  cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
   double largestArea = 0.0;
   const std::vector<cv::Point>* largest = nullptr;
@@ -79,6 +132,37 @@ std::optional<Detection> detectLargestContour(const cv::Mat& gray, double minAre
   return detection;
 }
 
+/**
+ * Classifies exposure from the grayscale image's brightness histogram: too
+ * dark if a large fraction of pixels sit in the shadow bins, too bright if a
+ * large fraction sit in the highlight bins.
+ */
+ExposureWarning computeExposureWarning(const cv::Mat& gray) {
+  cv::Mat histogram;
+  const int histSize = kExposureHistogramBins;
+  const float range[] = {0.0f, 256.0f};
+  const float* histRange = range;
+  cv::calcHist(&gray, 1, nullptr, cv::Mat(), histogram, 1, &histSize, &histRange);
+
+  double shadowCount = 0.0;
+  double highlightCount = 0.0;
+  for (int bin = 0; bin < kShadowClipBin; bin++) {
+    shadowCount += histogram.at<float>(bin);
+  }
+  for (int bin = kHighlightClipBin; bin < histSize; bin++) {
+    highlightCount += histogram.at<float>(bin);
+  }
+
+  const double totalPixels = static_cast<double>(gray.total());
+  if (shadowCount / totalPixels > kExposureClipFraction) {
+    return ExposureWarning::TooDark;
+  }
+  if (highlightCount / totalPixels > kExposureClipFraction) {
+    return ExposureWarning::TooBright;
+  }
+  return ExposureWarning::None;
+}
+
 /** Previous bounding box grown by the margin and clamped to the image. */
 cv::Rect expandedRoi(const cv::Rect& box, const cv::Size& imageSize) {
   const int marginX = static_cast<int>(box.width * kRoiMarginFraction);
@@ -88,6 +172,10 @@ cv::Rect expandedRoi(const cv::Rect& box, const cv::Size& imageSize) {
 }
 
 } // namespace
+
+void resetPipelineState() {
+  gState = PipelineState{};
+}
 
 AnalysisResult analyzeFrame(const uint8_t* data,
                             int width,
@@ -125,11 +213,12 @@ AnalysisResult analyzeFrame(const uint8_t* data,
   // The Mat wraps the camera buffer in place (zero-copy); for YUV frames the
   // Y plane already is the grayscale image.
   //
-  // 1. Downscale FIRST, with nearest-neighbor sampling: unlike INTER_AREA
-  //    (which averages, i.e. reads, every full-resolution pixel), it only
-  //    reads the ~320-wide grid of target pixels, so the cost of everything
-  //    below is independent of the camera resolution. The aliasing it
-  //    introduces is absorbed by the Gaussian blur that precedes Canny.
+  // 1. Downscale FIRST, with INTER_AREA (proper area-averaging): it reads
+  //    every full-resolution source pixel, so cost scales with camera
+  //    resolution again - but unlike INTER_NEAREST (which only samples a
+  //    ~320-wide grid and skips the rest), it doesn't alias fine fabric
+  //    patterns/textures into moiré noise that would otherwise survive the
+  //    Gaussian blur and register as spurious contours.
   // 2. Grayscale SECOND, on the downscaled image, so the RGBA→gray
   //    conversion touches ~0.15 MP instead of the full frame.
   const double scale = width > kTargetProcessingWidth
@@ -143,7 +232,7 @@ AnalysisResult analyzeFrame(const uint8_t* data,
     case PixelLayout::GRAY8: {
       cv::Mat full(height, width, CV_8UC1, const_cast<uint8_t*>(data), bytesPerRow);
       if (scale < 1.0) {
-        cv::resize(full, small, smallSize, 0, 0, cv::INTER_NEAREST);
+        cv::resize(full, small, smallSize, 0, 0, cv::INTER_AREA);
       } else {
         small = full;
       }
@@ -154,7 +243,7 @@ AnalysisResult analyzeFrame(const uint8_t* data,
       cv::Mat full(height, width, CV_8UC4, const_cast<uint8_t*>(data), bytesPerRow);
       cv::Mat smallColor;
       if (scale < 1.0) {
-        cv::resize(full, smallColor, smallSize, 0, 0, cv::INTER_NEAREST);
+        cv::resize(full, smallColor, smallSize, 0, 0, cv::INTER_AREA);
       } else {
         smallColor = full;
       }
@@ -163,6 +252,8 @@ AnalysisResult analyzeFrame(const uint8_t* data,
       break;
     }
   }
+
+  result.exposureWarning = computeExposureWarning(small);
 
   const double minArea = kMinContourAreaFraction * small.cols * small.rows;
 
@@ -185,14 +276,40 @@ AnalysisResult analyzeFrame(const uint8_t* data,
   if (detection.has_value()) {
     result.found = true;
     // Map back: ROI offset, then undo the downscale.
-    result.centroidX = (detection->centroid.x + roiOffset.x) / scale;
-    result.centroidY = (detection->centroid.y + roiOffset.y) / scale;
+    const double rawCentroidX = (detection->centroid.x + roiOffset.x) / scale;
+    const double rawCentroidY = (detection->centroid.y + roiOffset.y) / scale;
     result.contourArea = detection->area / (scale * scale);
+
+    // EMA-smooth the reported centroid to damp frame-to-frame jitter in the
+    // on-screen alignment arrow. The ROI above tracks the raw (unsmoothed)
+    // detection, so a lagging smoothed point can never cause the search
+    // window to fall behind a fast-moving object.
+    if (!gState.hasSmoothedCentroid) {
+      gState.smoothedCentroidX = rawCentroidX;
+      gState.smoothedCentroidY = rawCentroidY;
+      gState.hasSmoothedCentroid = true;
+    } else {
+      gState.smoothedCentroidX =
+          kCentroidSmoothingAlpha * rawCentroidX + (1.0 - kCentroidSmoothingAlpha) * gState.smoothedCentroidX;
+      gState.smoothedCentroidY =
+          kCentroidSmoothingAlpha * rawCentroidY + (1.0 - kCentroidSmoothingAlpha) * gState.smoothedCentroidY;
+    }
+    result.centroidX = gState.smoothedCentroidX;
+    result.centroidY = gState.smoothedCentroidY;
+
+    const cv::Rect boundingBoxInSmall = detection->boundingBox + roiOffset;
+    result.boundingBoxX = boundingBoxInSmall.x / scale;
+    result.boundingBoxY = boundingBoxInSmall.y / scale;
+    result.boundingBoxWidth = boundingBoxInSmall.width / scale;
+    result.boundingBoxHeight = boundingBoxInSmall.height / scale;
 
     gState.roi = expandedRoi(detection->boundingBox + roiOffset, small.size());
     gState.hasRoi = gState.roi.area() > 0;
   } else {
     gState.hasRoi = false;
+    // Object lost: next detection should snap to place, not lerp in from a
+    // now-stale position.
+    gState.hasSmoothedCentroid = false;
   }
 
   const auto elapsed = std::chrono::steady_clock::now() - startTime;
@@ -200,6 +317,41 @@ AnalysisResult analyzeFrame(const uint8_t* data,
 
   gState.lastResult = result;
   return result;
+}
+
+bool cropPhotoToBoundingBox(const std::string& sourcePath,
+                             const std::string& destPath,
+                             double boxX,
+                             double boxY,
+                             double boxWidth,
+                             double boxHeight,
+                             int analysisFrameWidth,
+                             int analysisFrameHeight) {
+  if (analysisFrameWidth <= 0 || analysisFrameHeight <= 0 || boxWidth <= 0.0 || boxHeight <= 0.0) {
+    return false;
+  }
+
+  const cv::Mat photo = cv::imread(sourcePath, cv::IMREAD_COLOR);
+  if (photo.empty()) {
+    return false;
+  }
+
+  // The box was detected in the analysis frame's pixel space, which is
+  // generally a different resolution than the captured photo (though the
+  // same aspect ratio/orientation, for a given camera device) - scale
+  // proportionally into the photo's own pixel space.
+  const double scaleX = static_cast<double>(photo.cols) / analysisFrameWidth;
+  const double scaleY = static_cast<double>(photo.rows) / analysisFrameHeight;
+
+  const cv::Rect photoBounds(0, 0, photo.cols, photo.rows);
+  const cv::Rect cropRect = cv::Rect(static_cast<int>(boxX * scaleX), static_cast<int>(boxY * scaleY),
+                                      static_cast<int>(boxWidth * scaleX), static_cast<int>(boxHeight * scaleY)) &
+                             photoBounds;
+  if (cropRect.area() <= 0) {
+    return false;
+  }
+
+  return cv::imwrite(destPath, photo(cropRect));
 }
 
 } // namespace visionapp

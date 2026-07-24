@@ -24,8 +24,15 @@ Java_com_visionapp_frameprocessors_ProductAnalyzerPlugin_nativeUpdateGyroscope(
   visionapp::SensorFusion::instance().updateGyroscope(gx, gy, gz, timestampSeconds);
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_visionapp_frameprocessors_ProductAnalyzerPlugin_nativeResetPipeline(
+    JNIEnv* /*env*/, jclass /*clazz*/) {
+  visionapp::resetPipelineState();
+}
+
 // Returns [found, centroidX, centroidY, contourArea, frameWidth, frameHeight,
-//          pitch, roll, latencyMs, processed].
+//          pitch, roll, latencyMs, processed, boundingBoxX, boundingBoxY,
+//          boundingBoxWidth, boundingBoxHeight, exposureWarning].
 extern "C" JNIEXPORT jdoubleArray JNICALL
 Java_com_visionapp_frameprocessors_ProductAnalyzerPlugin_nativeAnalyzeFrame(
     JNIEnv* env, jclass /*clazz*/, jobject buffer, jint width, jint height, jint rowStride, jboolean isGrayscale) {
@@ -35,7 +42,7 @@ Java_com_visionapp_frameprocessors_ProductAnalyzerPlugin_nativeAnalyzeFrame(
   const visionapp::AnalysisResult result =
       visionapp::analyzeFrame(data, width, height, static_cast<size_t>(rowStride), layout);
 
-  const double values[10] = {
+  const double values[15] = {
       result.found ? 1.0 : 0.0,
       result.centroidX,
       result.centroidY,
@@ -46,8 +53,28 @@ Java_com_visionapp_frameprocessors_ProductAnalyzerPlugin_nativeAnalyzeFrame(
       result.rollDegrees,
       result.latencyMs,
       result.processed ? 1.0 : 0.0,
+      result.boundingBoxX,
+      result.boundingBoxY,
+      result.boundingBoxWidth,
+      result.boundingBoxHeight,
+      static_cast<double>(static_cast<int>(result.exposureWarning)),
   };
-  jdoubleArray array = env->NewDoubleArray(10);
-  env->SetDoubleArrayRegion(array, 0, 10, values);
+  jdoubleArray array = env->NewDoubleArray(15);
+  env->SetDoubleArrayRegion(array, 0, 15, values);
   return array;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_visionapp_nativemodules_ProductCropModule_nativeCropToBoundingBox(
+    JNIEnv* env, jclass /*clazz*/, jstring sourcePath, jstring destPath, jdouble boxX, jdouble boxY,
+    jdouble boxWidth, jdouble boxHeight, jint analysisFrameWidth, jint analysisFrameHeight) {
+  const char* sourceChars = env->GetStringUTFChars(sourcePath, nullptr);
+  const char* destChars = env->GetStringUTFChars(destPath, nullptr);
+
+  const bool success = visionapp::cropPhotoToBoundingBox(sourceChars, destChars, boxX, boxY, boxWidth, boxHeight,
+                                                          analysisFrameWidth, analysisFrameHeight);
+
+  env->ReleaseStringUTFChars(sourcePath, sourceChars);
+  env->ReleaseStringUTFChars(destPath, destChars);
+  return success ? JNI_TRUE : JNI_FALSE;
 }

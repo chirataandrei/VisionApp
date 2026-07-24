@@ -71,6 +71,10 @@
 }
 
 - (id _Nullable)callback:(Frame*)frame withArguments:(NSDictionary* _Nullable)arguments {
+  if ([arguments[@"reset"] boolValue]) {
+    visionapp::resetPipelineState();
+  }
+
   CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(frame.buffer);
   if (pixelBuffer == nil) {
     return nil;
@@ -97,6 +101,20 @@
 
   CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
+  NSString* exposureWarning;
+  switch (result.exposureWarning) {
+    case visionapp::ExposureWarning::TooDark:
+      exposureWarning = @"dark";
+      break;
+    case visionapp::ExposureWarning::TooBright:
+      exposureWarning = @"bright";
+      break;
+    case visionapp::ExposureWarning::None:
+    default:
+      exposureWarning = @"none";
+      break;
+  }
+
   // Converted to a plain JS object by VisionCamera via JSI (no bridge).
   return @{
     @"found" : @(result.found),
@@ -111,6 +129,13 @@
     @"roll" : @(result.rollDegrees),
     @"latencyMs" : @(result.latencyMs),
     @"processed" : @(result.processed),
+    @"boundingBox" : @{
+      @"x" : @(result.boundingBoxX),
+      @"y" : @(result.boundingBoxY),
+      @"width" : @(result.boundingBoxWidth),
+      @"height" : @(result.boundingBoxHeight),
+    },
+    @"exposureWarning" : exposureWarning,
   };
 }
 
